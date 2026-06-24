@@ -8,6 +8,7 @@
 #include <linux/uaccess.h>   
 #include <linux/interrupt.h> 
 #include <linux/spinlock.h>  // Mandatory header for spin_lock architectures
+#include <linux/sched/signal.h> // Required for signal_pending()
 
 #include "rpi_uart_driver.h"
 
@@ -47,6 +48,9 @@ static DEFINE_SPINLOCK(buffer_lock);
 static irqreturn_t rpi_uart_isr(int irq, void *dev_id)
 {
     u32 interrupt_status;
+    u32 raw_data;
+    unsigned int next_head;
+    char ch;
     irqreturn_t status = IRQ_NONE;
     unsigned long flags;
 
@@ -62,11 +66,11 @@ static irqreturn_t rpi_uart_isr(int irq, void *dev_id)
         spin_lock_irqsave(&buffer_lock, flags);
 
         while (!(ioread32(uart_base + UART_FR) & UART_FR_RXFE)) {
-            u32 raw_data = ioread32(uart_base + UART_DR);
-            char ch = (char)(raw_data & 0xFF);
-            
+            raw_data = ioread32(uart_base + UART_DR);
+            ch = (char)(raw_data & 0xFF);
+
             /* Calculate the next hypothetical head pointer location */
-            unsigned int next_head = (rx_head + 1) % RING_BUFFER_SIZE;
+            next_head = (rx_head + 1) % RING_BUFFER_SIZE;
 
             if (next_head != rx_tail) {
                 /* Safe: Space is available in the circular queue */
@@ -78,10 +82,12 @@ static irqreturn_t rpi_uart_isr(int irq, void *dev_id)
             }
         }
 
-        spin_unlock_irqrestore(&buffer_lock, flags);
-
-        /* Clear the hardware interrupt line */
+        /* Clear the hardware interrupt line while still holding the lock
+         * to prevent a spurious ISR from a byte arriving between unlock and clear.
+         */
         iowrite32(UART_INT_RX, uart_base + UART_ICR);
+
+        spin_unlock_irqrestore(&buffer_lock, flags);
     }
 
     return status;
@@ -145,7 +151,13 @@ static ssize_t rpi_uart_read(struct file *filep, char __user *buffer, size_t len
         bytes_read++;
     }
 
-    /* Return total count read. If buffer was empty from the start, returns 0 (EOF) */
+    /* If no data was available, return -EAGAIN to avoid a false EOF signal.
+     * Returning 0 would tell userspace the device has no more data (ever),
+     * causing programs like cat to exit immediately.
+     */
+    if (bytes_read == 0)
+        return -EAGAIN;
+
     return bytes_read;
 }
 
@@ -162,7 +174,13 @@ static ssize_t rpi_uart_write(struct file *filep, const char __user *buffer, siz
             return -EFAULT;
         }
         for (i = 0; i < bytes_to_copy; i++) {
+            unsigned int timeout = 100000;
+
             while (ioread32(uart_base + UART_FR) & UART_FR_TXFF) {
+                if (--timeout == 0)
+                    return bytes_written > 0 ? (ssize_t)bytes_written : -EIO;
+                if (signal_pending(current))
+                    return bytes_written > 0 ? (ssize_t)bytes_written : -ERESTARTSYS;
                 cpu_relax();
             }
             iowrite32(kbuf[i], uart_base + UART_DR);
@@ -193,26 +211,29 @@ static int __init rpi_uart_init(void)
     uart_base = ioremap(UART0_PHYS_BASE, UART_REG_SIZE);
     if (!uart_base) return -ENOMEM;
 
-    result = request_irq(uart_irq, rpi_uart_isr, IRQF_SHARED, DEVICE_NAME, &uart_cdev);
+    result = alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
     if (result < 0) goto unmap_io;
+
+    cdev_init(&uart_cdev, &uart_fops);
+    uart_cdev.owner = THIS_MODULE;
+
+    result = cdev_add(&uart_cdev, dev_num, 1);
+    if (result < 0) goto unregister_chrdev;
+
+    /* Register IRQ after cdev is fully initialized, since &uart_cdev is
+     * passed as the dev_id cookie and must not be reinitialized after this.
+     */
+    result = request_irq(uart_irq, rpi_uart_isr, IRQF_SHARED, DEVICE_NAME, &uart_cdev);
+    if (result < 0) goto delete_cdev;
 
     imsc_reg = ioread32(uart_base + UART_IMSC);
     imsc_reg |= UART_INT_RX;
     iowrite32(imsc_reg, uart_base + UART_IMSC);
 
-    result = alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
-    if (result < 0) goto mask_interrupts;
-
-    cdev_init(&uart_cdev, &uart_fops);
-    uart_cdev.owner = THIS_MODULE;
-    
-    result = cdev_add(&uart_cdev, dev_num, 1);
-    if (result < 0) goto unregister_chrdev;
-
     uart_class = class_create(CLASS_NAME);
     if (IS_ERR(uart_class)) {
         result = PTR_ERR(uart_class);
-        goto delete_cdev;
+        goto mask_interrupts;
     }
 
     uart_device = device_create(uart_class, NULL, dev_num, NULL, DEVICE_NAME);
@@ -226,15 +247,15 @@ static int __init rpi_uart_init(void)
 
 destroy_class:
     class_destroy(uart_class);
-delete_cdev:
-    cdev_del(&uart_cdev);
-unregister_chrdev:
-    unregister_chrdev_region(dev_num, 1);
 mask_interrupts:
     imsc_reg = ioread32(uart_base + UART_IMSC);
     imsc_reg &= ~UART_INT_RX;
     iowrite32(imsc_reg, uart_base + UART_IMSC);
     free_irq(uart_irq, &uart_cdev);
+delete_cdev:
+    cdev_del(&uart_cdev);
+unregister_chrdev:
+    unregister_chrdev_region(dev_num, 1);
 unmap_io:
     iounmap(uart_base);
     return result;
